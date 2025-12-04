@@ -1,0 +1,12 @@
+**/.vscode/
+
+*.o
+
+fennec
+fennec.exe
+
+*.fasm
+*.asm
+*.fxf
+*.lbr
+*.bin

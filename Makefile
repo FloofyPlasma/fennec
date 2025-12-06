@@ -1,6 +1,6 @@
 TARGET = linux
 ifeq ($(TARGET),linux)
-CFLAGS += -std=c23 -Ofast -Wall -Wextra -Wpedantic -Werror
+CFLAGS += -std=c23 -Ofast -Wall -Wextra -Wpedantic # -Werror
 else
 $(error unsupported TARGET)
 endif

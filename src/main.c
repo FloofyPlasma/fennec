@@ -10,6 +10,7 @@ typedef enum {
   TOK_IF,
   TOK_ELSE,
   TOK_WHILE,
+  TOK_VOID,
   TOK_IDENT,
   TOK_NUMBER,
   TOK_LPAREN,
@@ -36,7 +37,11 @@ typedef enum {
   TOK_PIPE,
   TOK_CARET,
   TOK_LSHIFT,
-  TOK_RSHIFT
+  TOK_RSHIFT,
+  TOK_LBRACKET,
+  TOK_RBRACKET,
+  TOK_STRING,
+  TOK_ASM
 } TokenType;
 
 typedef struct {
@@ -62,7 +67,12 @@ typedef enum {
   NODE_VAR,
   NODE_ASSIGN,
   NODE_CALL,
-  NODE_BLOCK
+  NODE_BLOCK,
+  NODE_DEREF,
+  NODE_ADDR,
+  NODE_INDEX,
+  NODE_ASM,
+  NODE_GLOBAL_VAR
 } NodeType;
 
 typedef struct ASTNode {
@@ -106,12 +116,30 @@ typedef struct ASTNode {
       struct ASTNode **stmts;
       int stmt_count;
     } block;
+    struct {
+      struct ASTNode *expr;
+    } unary;
+    struct {
+      struct ASTNode *array;
+      struct ASTNode *index;
+    } index;
+    struct {
+      char *code;
+    } asm_code;
+    struct {
+      char *name;
+      char *string_value;
+      int int_value;
+      int is_string;
+    } global_var;
   };
 } ASTNode;
 
 typedef struct {
   char *name;
   int offset; /* Offset from the frame pointer */
+  int is_array;
+  int array_size;
 } Symbol;
 
 typedef struct {
@@ -163,6 +191,8 @@ Token lexer_next(Lexer *lex) {
 
     if (strcmp(tok.text, "int") == 0) {
       tok.type = TOK_INT;
+    } else if (strcmp(tok.text, "void") == 0) {
+      tok.type = TOK_VOID;
     } else if (strcmp(tok.text, "return") == 0) {
       tok.type = TOK_RETURN;
     } else if (strcmp(tok.text, "if") == 0) {
@@ -171,6 +201,8 @@ Token lexer_next(Lexer *lex) {
       tok.type = TOK_ELSE;
     } else if (strcmp(tok.text, "while") == 0) {
       tok.type = TOK_WHILE;
+    } else if (strcmp(tok.text, "asm") == 0) {
+      tok.type = TOK_ASM;
     } else {
       tok.type = TOK_IDENT;
     }
@@ -198,6 +230,24 @@ Token lexer_next(Lexer *lex) {
     return tok;
   }
 
+  /* String literals */
+  if (lex->input[lex->pos] == '"') {
+    lex->pos++;
+    int start = lex->pos;
+    while (lex->input[lex->pos] != '"' && lex->input[lex->pos] != '\0') {
+      lex->pos++;
+    }
+    int len = lex->pos - start;
+    tok.type = TOK_STRING;
+    tok.text = malloc(len + 1);
+    strncpy(tok.text, &lex->input[start], len);
+    tok.text[len] = '\0';
+    if (lex->input[lex->pos] == '"') {
+      lex->pos++;
+    }
+    return tok;
+  }
+
   /* Operators */
   switch (lex->input[lex->pos]) {
   case '(': {
@@ -214,6 +264,14 @@ Token lexer_next(Lexer *lex) {
   } break;
   case '}': {
     tok.type = TOK_RBRACE;
+    lex->pos++;
+  } break;
+  case '[': {
+    tok.type = TOK_LBRACKET;
+    lex->pos++;
+  } break;
+  case ']': {
+    tok.type = TOK_RBRACKET;
     lex->pos++;
   } break;
   case ';': {
@@ -484,6 +542,76 @@ void codegen_expr(CodeGen *cg, ASTNode *node) {
     fprintf(cg->out, "\tcall %s\n", node->call.name);
     /* Result is in r0 */
   } break;
+  case NODE_DEREF: {
+    /* Derefence: *ptr -> load from address in ptr */
+    codegen_expr(cg, node->unary.expr);
+    fprintf(cg->out, "\tmov r0, [r0]\n");
+  } break;
+  case NODE_ADDR: {
+    /* Address-of: &var -> get address of variable */
+    if (node->unary.expr->type == NODE_VAR) {
+      int idx = symtab_lookup(&cg->symtab, node->unary.expr->name);
+      if (idx < 0) {
+        fprintf(stderr, "Undefined variable: %s\n", node->unary.expr->name);
+        exit(1);
+      }
+      int offset = symtab_get_offset(&cg->symtab, idx);
+      fprintf(cg->out, "\tmov r0, rfp\n");
+      fprintf(cg->out, "\tadd r0, %d\n", offset);
+    } else if (node->unary.expr->type == NODE_INDEX) {
+      /* &array[index] - calculate address */
+      codegen_expr(cg, node->unary.expr->index.index);
+      fprintf(cg->out, "\tpush r0\n");
+
+      /* Get base address of array */
+      if (node->unary.expr->index.array->type == NODE_VAR) {
+        int idx =
+            symtab_lookup(&cg->symtab, node->unary.expr->index.array->name);
+        if (idx < 0) {
+          fprintf(stderr, "Undefined array: %s\n",
+                  node->unary.expr->index.array->name);
+          exit(1);
+        }
+        int offset = symtab_get_offset(&cg->symtab, idx);
+        fprintf(cg->out, "\tmov r0, rfp\n");
+        fprintf(cg->out, "\tadd r0, %d\n", offset);
+      }
+
+      /* Calculate offset: index * 4 */
+      fprintf(cg->out, "\tpop r1\n");
+      fprintf(cg->out, "\tsla r1, 2\n");
+      fprintf(cg->out, "\tadd r0, r1\n");
+    } else {
+      fprintf(stderr, "Cannot take address of expression\n");
+      exit(1);
+    }
+  } break;
+  case NODE_INDEX: {
+    /* Array indexing: arr[index] -> load from arr + index * 4 */
+    codegen_expr(cg, node->index.index);
+    fprintf(cg->out, "\tpush r0\n");
+
+    /* Get base address of array */
+    if (node->index.array->type == NODE_VAR) {
+      int idx = symtab_lookup(&cg->symtab, node->index.array->name);
+      if (idx < 0) {
+        fprintf(stderr, "Undefined array: %s\n", node->index.array->name);
+        exit(1);
+      }
+      int offset = symtab_get_offset(&cg->symtab, idx);
+      fprintf(cg->out, "\tmov r0, rfp\n");
+      fprintf(cg->out, "\tadd r0, %d\n", offset);
+    } else {
+      /* Expression that should eval to a pointer */
+      codegen_expr(cg, node->index.array);
+    }
+
+    /* Calculate offset and load */
+    fprintf(cg->out, "\tpop r1\n");
+    fprintf(cg->out, "\tsla r1, 2\n");
+    fprintf(cg->out, "\tadd r0, r1\n");
+    fprintf(cg->out, "\tmov r0, [r0]\n");
+  } break;
   default:
     break;
   }
@@ -535,6 +663,11 @@ void codegen_stmt(CodeGen *cg, ASTNode *node) {
     for (int i = 0; i < node->block.stmt_count; i++) {
       codegen_stmt(cg, node->block.stmts[i]);
     }
+  } break;
+
+  case NODE_ASM: {
+    /* Assume the user's inline asm is correct :3 */
+    fprintf(cg->out, "%s\n", node->asm_code.code);
   } break;
 
   default: {
@@ -696,6 +829,41 @@ ASTNode *new_block(ASTNode **stmts, int stmt_count) {
   return node;
 }
 
+ASTNode *new_deref(ASTNode *expr) {
+  ASTNode *node = new_node(NODE_DEREF);
+  node->unary.expr = expr;
+  return node;
+}
+
+ASTNode *new_addr(ASTNode *expr) {
+  ASTNode *node = new_node(NODE_ADDR);
+  node->unary.expr = expr;
+  return node;
+}
+
+ASTNode *new_index(ASTNode *array, ASTNode *index) {
+  ASTNode *node = new_node(NODE_INDEX);
+  node->index.array = array;
+  node->index.index = index;
+  return node;
+}
+
+ASTNode *new_asm(char *code) {
+  ASTNode *node = new_node(NODE_ASM);
+  node->asm_code.code = strdup(code);
+  return node;
+}
+
+ASTNode *new_global_var(char *name, char *string_value, int int_value,
+                        int is_string) {
+  ASTNode *node = new_node(NODE_GLOBAL_VAR);
+  node->global_var.name = strdup(name);
+  node->global_var.string_value = string_value ? strdup(string_value) : NULL;
+  node->global_var.int_value = int_value;
+  node->global_var.is_string = is_string;
+  return node;
+}
+
 ASTNode *parse_primary(Parser *p) {
   if (parser_check(p, TOK_NUMBER)) {
     int value = p->current.value;
@@ -735,6 +903,14 @@ ASTNode *parse_primary(Parser *p) {
       return new_call(name, args, arg_count);
     }
 
+    /* Array indexing */
+    if (parser_check(p, TOK_LBRACKET)) {
+      parser_advance(p);
+      ASTNode *index = parse_expression(p);
+      parser_expect(p, TOK_RBRACKET);
+      return new_index(new_var(name), index);
+    }
+
     /* Variable reference */
     return new_var(name);
   }
@@ -756,6 +932,20 @@ ASTNode *parse_unary(Parser *p) {
     ASTNode *expr = parse_unary(p);
 
     return new_binop(TOK_MINUS, new_number(0), expr);
+  }
+
+  if (parser_check(p, TOK_STAR)) {
+    /* Dereference operator */
+    parser_advance(p);
+    ASTNode *expr = parse_unary(p);
+    return new_deref(expr);
+  }
+
+  if (parser_check(p, TOK_AMPERSAND)) {
+    /* Address-of operator */
+    parser_advance(p);
+    ASTNode *expr = parse_unary(p);
+    return new_addr(expr);
   }
 
   return parse_primary(p);
@@ -942,6 +1132,21 @@ ASTNode *parse_statement(Parser *p) {
     return parse_block(p);
   }
 
+  /* Inline assembly */
+  if (parser_check(p, TOK_ASM)) {
+    parser_advance(p);
+    parser_expect(p, TOK_LPAREN);
+    if (!parser_check(p, TOK_STRING)) {
+      fprintf(stderr, "Expected string literal after asm(\n");
+      exit(1);
+    }
+    char *asm_code = strdup(p->current.text);
+    parser_advance(p);
+    parser_expect(p, TOK_RPAREN);
+    parser_expect(p, TOK_SEMICOLON);
+    return new_asm(asm_code);
+  }
+
   /* Variable declaration */
   if (parser_check(p, TOK_INT)) {
     parser_advance(p);
@@ -951,6 +1156,21 @@ ASTNode *parse_statement(Parser *p) {
     }
     char *name = strdup(p->current.text);
     parser_advance(p);
+
+    /* Array declaration */
+    if (parser_check(p, TOK_LBRACKET)) {
+      parser_advance(p);
+      if (!parser_check(p, TOK_NUMBER)) {
+        fprintf(stderr, "Expected array size\n");
+        exit(1);
+      }
+      int size = p->current.value;
+      parser_advance(p);
+      parser_expect(p, TOK_RBRACKET);
+      parser_expect(p, TOK_SEMICOLON);
+      /* For arrays, we just allocate space and create a dummy assignment */
+      return new_assign(name, new_number(size * 4));
+    }
 
     ASTNode *init = NULL;
     if (parser_check(p, TOK_ASSIGN)) {
@@ -977,12 +1197,14 @@ ASTNode *parse_statement(Parser *p) {
 
 ASTNode *parse_function(Parser *p) {
   /* Return type */
-  if (!parser_check(p, TOK_INT)) {
+  if (parser_check(p, TOK_VOID)) {
+    parser_advance(p);
+  } else if (parser_check(p, TOK_INT)) {
+    parser_advance(p);
+  } else {
     fprintf(stderr, "Expected return type\n");
     exit(1);
   }
-
-  parser_advance(p);
 
   /* Function name */
   if (!parser_check(p, TOK_IDENT)) {
@@ -1002,6 +1224,12 @@ ASTNode *parse_function(Parser *p) {
 
   if (!parser_check(p, TOK_RPAREN)) {
     while (1) {
+      if (parser_check(p, TOK_VOID)) {
+        /* void parameter list */
+        parser_advance(p);
+        break;
+      }
+
       parser_expect(p, TOK_INT);
       if (!parser_check(p, TOK_IDENT)) {
         fprintf(stderr, "Expected parameter name\n");
@@ -1048,7 +1276,87 @@ ASTNode *parse_program(Parser *p) {
       prog->block.stmts = realloc(prog->block.stmts, cap * sizeof(ASTNode *));
     }
 
-    prog->block.stmts[prog->block.stmt_count++] = parse_function(p);
+    /* Check for global variables */
+    if (parser_check(p, TOK_INT) || parser_check(p, TOK_VOID)) {
+      parser_advance(p);
+
+      if (!parser_check(p, TOK_IDENT)) {
+        fprintf(stderr, "Expected identifier\n");
+        exit(1);
+      }
+      char *name = strdup(p->current.text);
+      parser_advance(p);
+
+      /* Check if this is a function (has parenthesis) */
+      if (parser_check(p, TOK_LPAREN)) {
+        /* This is a function, for now parse manually. */
+        /* FIXME: Add support for backing up the parser so we can put this back
+         * in the parse_function function. */
+        ASTNode **params = NULL;
+        int param_count = 0;
+        int param_cap = 0;
+
+        parser_advance(p);
+
+        if (!parser_check(p, TOK_RPAREN)) {
+          while (1) {
+            if (parser_check(p, TOK_VOID)) {
+              parser_advance(p);
+              break;
+            }
+
+            parser_expect(p, TOK_INT);
+            if (!parser_check(p, TOK_IDENT)) {
+              fprintf(stderr, "Expected parameter name\n");
+              exit(1);
+            }
+
+            if (param_count >= param_cap) {
+              param_cap = param_cap == 0 ? 4 : param_cap * 2;
+              params = realloc(params, param_cap * sizeof(ASTNode *));
+            }
+            params[param_count++] = new_var(p->current.text);
+            parser_advance(p);
+
+            if (!parser_check(p, TOK_COMMA)) {
+              break;
+            }
+            parser_advance(p);
+          }
+        }
+
+        parser_expect(p, TOK_RPAREN);
+        ASTNode *body = parse_block(p);
+
+        ASTNode *func = new_node(NODE_FUNCTION);
+        func->function.name = name;
+        func->function.params = params;
+        func->function.param_count = param_count;
+        func->function.body = body;
+
+        prog->block.stmts[prog->block.stmt_count++] = func;
+      } else if (parser_check(p, TOK_ASSIGN)) {
+        /* Global variable with initializer */
+        parser_advance(p);
+        if (parser_check(p, TOK_STRING)) {
+          prog->block.stmts[prog->block.stmt_count++] =
+              new_global_var(name, p->current.text, 0, 1);
+          parser_advance(p);
+        } else if (parser_check(p, TOK_NUMBER)) {
+          prog->block.stmts[prog->block.stmt_count++] =
+              new_global_var(name, NULL, p->current.value, 0);
+          parser_advance(p);
+        }
+        parser_expect(p, TOK_SEMICOLON);
+      } else {
+        parser_expect(p, TOK_SEMICOLON);
+        prog->block.stmts[prog->block.stmt_count++] =
+            new_global_var(name, NULL, 0, 0);
+      }
+    } else {
+      /* Must be a function */
+      prog->block.stmts[prog->block.stmt_count++] = parse_function(p);
+    }
   }
 
   return prog;
@@ -1066,39 +1374,131 @@ void compile(char *source, FILE *output) {
   CodeGen cg;
   codegen_init(&cg, output);
 
-  fprintf(output, "; Fox32 C Compiler Output\n\n");
+  fprintf(output, "; FenneC Compiler Output\n\n");
 
+  /* Generate main first */
   for (int i = 0; i < program->block.stmt_count; i++) {
-    codegen_function(&cg, program->block.stmts[i]);
+    ASTNode *func = program->block.stmts[i];
+    if (func->type == NODE_FUNCTION &&
+        strcmp(func->function.name, "main") == 0) {
+
+      fprintf(output, "\t; main function\n");
+
+      /* Reset symbol table */
+      for (int j = 0; j < cg.symtab.count; j++)
+        free(cg.symtab.symbols[j].name);
+      cg.symtab.count = 0;
+      cg.symtab.stack_offset = 0;
+
+      fprintf(output, "\tpush rfp\n");
+      fprintf(output, "\tmov rfp, rsp\n");
+
+      /* Push up to 8 parameters */
+      for (int j = 0; j < func->function.param_count && j < 8; j++) {
+        fprintf(output, "\tpush r%d\n", j);
+      }
+
+      /* Add parameters to symbol table */
+      for (int j = 0; j < func->function.param_count; j++) {
+        if (cg.symtab.count >= cg.symtab.capacity) {
+          cg.symtab.capacity =
+              cg.symtab.capacity == 0 ? 8 : cg.symtab.capacity * 2;
+          cg.symtab.symbols =
+              realloc(cg.symtab.symbols, cg.symtab.capacity * sizeof(Symbol));
+        }
+        cg.symtab.symbols[cg.symtab.count].name =
+            strdup(func->function.params[j]->name);
+        cg.symtab.symbols[cg.symtab.count].offset =
+            4 + (func->function.param_count - 1 - j) * 4;
+        cg.symtab.count++;
+      }
+
+      /* Generate function body */
+      codegen_stmt(&cg, func->function.body);
+
+      fprintf(output, "\tmov r0, 0\n");
+      fprintf(output, "\tpop rfp\n");
+      // fprintf(output, "ret\n\n");
+      break; /* main emitted, stop loop */
+    }
   }
+
+  /* Generate other functions */
+  for (int i = 0; i < program->block.stmt_count; i++) {
+    ASTNode *func = program->block.stmts[i];
+    if (func->type == NODE_FUNCTION &&
+        strcmp(func->function.name, "main") != 0) {
+      codegen_function(&cg, func);
+    }
+  }
+
+  /* Now we can generate the globals :3 */
+  for (int i = 0; i < program->block.stmt_count; i++) {
+    if (program->block.stmts[i]->type == NODE_GLOBAL_VAR) {
+      ASTNode *gvar = program->block.stmts[i];
+      if (gvar->global_var.is_string) {
+        fprintf(output, "%s: data.strz \"%s\"\n", gvar->global_var.name,
+                gvar->global_var.string_value);
+      } else {
+        fprintf(output, "%s: data.32 %d\n", gvar->global_var.name,
+                gvar->global_var.int_value);
+      }
+    }
+  }
+
+  fprintf(output, "\n; Includes :3\n\n");
+  fprintf(output, "#include \"../fox32rom/fox32rom.def\"\n");
+  fprintf(output, "#include \"../fox32os/fox32os.def\"\n\n");
 }
 
 int main() {
-  char *test_program = "int add(int a, int b) {\n"
-                       "    return a + b;\n"
-                       "}\n"
-                       "\n"
-                       "int factorial(int n) {\n"
-                       "    int result;\n"
-                       "    result = 1;\n"
-                       "    while (n > 1) {\n"
-                       "        result = result * n;\n"
-                       "        n = n - 1;\n"
-                       "    }\n"
-                       "    return result;\n"
-                       "}\n"
-                       "\n"
-                       "int main() {\n"
-                       "    int x;\n"
-                       "    int y;\n"
-                       "    x = 5;\n"
-                       "    y = 3;\n"
-                       "    if (x > y) {\n"
-                       "        return x + y;\n"
-                       "    } else {\n"
-                       "        return x - y;\n"
-                       "    }\n"
-                       "}\n";
+  char *test_program =
+      "int window_title = \"Hello fox32os!\";\n"
+      "int hello_str = \"Hello from C!\";\n"
+      "\n"
+      "void draw_hello(int window_struct) {\n"
+      "    int overlay_id;\n"
+      "    \n"
+      "    overlay_id = get_window_overlay_number(window_struct);\n"
+      "    \n"
+      "    asm(\"    mov r5, r0\");\n"
+      "    asm(\"    mov r0, hello_str\");\n"
+      "    asm(\"    mov r1, 32\");\n"
+      "    asm(\"    mov r2, 32\");\n"
+      "    asm(\"    mov r3, 0xFFFFFFFF\");\n"
+      "    asm(\"    mov r4, 0xFF000000\");\n"
+      "    asm(\"    call draw_str_to_overlay\");\n"
+      "}\n"
+      "\n"
+      "int main() {\n"
+      "    int window_title;\n"
+      "    int window_struct[10];\n"
+      "    int event_type;\n"
+      "    \n"
+      "    new_window(&window_struct[0], window_title, 256, 256, 64, 64, 0, "
+      "0);\n"
+      "    \n"
+      "    draw_hello(&window_struct[0]);\n"
+      "    \n"
+      "    while (1) {\n"
+      "        event_type = get_next_window_event(&window_struct[0]);\n"
+      "        \n"
+      "        if (event_type == 1) {\n"
+      "            asm(\"    call end_current_task\");\n"
+      "        }\n"
+      "        \n"
+      "        asm(\"    call yield_task\");\n"
+      "    }\n"
+      "    \n"
+      "    return 0;\n"
+      "}\n";
+
+  char *empty_test_program = "int main() {\n"
+                             "    int yeah;\n"
+                             "    yeah = 4;\n"
+                             "    yeah = yeah * 2;\n"
+                             "    asm(\"\tcall end_current_task\");\n"
+                             "}\n";
 
   compile(test_program, stdout);
 

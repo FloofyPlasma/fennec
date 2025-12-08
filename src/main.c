@@ -371,7 +371,7 @@ int symtab_add(SymbolTable *st, char *name) {
     st->capacity = st->capacity == 0 ? 8 : st->capacity * 2;
     st->symbols = realloc(st->symbols, st->capacity * sizeof(Symbol));
   }
-  st->stack_offset += 4; /* Each variable is 32-bit */
+  st->stack_offset += 40; /* Each variable is 32-bit */
   st->symbols[st->count].name = strdup(name);
   st->symbols[st->count].offset = st->stack_offset;
   st->count++;
@@ -511,6 +511,7 @@ void codegen_expr(CodeGen *cg, ASTNode *node) {
     if (idx < 0) {
       /* New local variable */
       offset = symtab_add(&cg->symtab, node->assign.var);
+      fprintf(cg->out, "\tsub rsp, 40\n");
     } else {
       /* Existing variable (param or local) */
       offset = symtab_get_offset(&cg->symtab, idx);
@@ -714,7 +715,7 @@ void codegen_function(CodeGen *cg, ASTNode *node) {
      */
     /* Stack: [rfp] [r0] [r1] [r2]... so r0 is at rfp+4, r1 at rfp+8, etc. */
     cg->symtab.symbols[cg->symtab.count].offset =
-        4 + (node->function.param_count - 1 - i) * 4;
+        40 + (node->function.param_count - 1 - i) * 4;
     cg->symtab.count++;
   }
 
@@ -1417,8 +1418,9 @@ void compile(char *source, FILE *output) {
       codegen_stmt(&cg, func->function.body);
 
       fprintf(output, "\tmov r0, 0\n");
+      fprintf(output, "\tmov rsp, rfp\n");
       fprintf(output, "\tpop rfp\n");
-      // fprintf(output, "ret\n\n");
+      fprintf(output, "ret\n\n");
       break; /* main emitted, stop loop */
     }
   }
@@ -1457,9 +1459,10 @@ int main() {
       "int hello_str = \"Hello from C!\";\n"
       "\n"
       "void draw_hello(int window_struct) {\n"
-      "    int overlay_id;\n"
       "    \n"
-      "    overlay_id = get_window_overlay_number(window_struct);\n"
+      /*       "    asm(\"   mov r0, window_struct\");\n"
+      "    asm(\"   call get_window_overlay_number\");\n" */
+      "    int overlay_id = get_window_overlay_number(window_struct);\n"
       "    \n"
       "    asm(\"    mov r5, r0\");\n"
       "    asm(\"    mov r0, hello_str\");\n"
@@ -1472,25 +1475,24 @@ int main() {
       "\n"
       "int main() {\n"
       "    int window_title;\n"
-      "    int window_struct[10];\n"
+      "    int window_struct[40];\n"
       "    int event_type;\n"
       "    \n"
-      "    new_window(&window_struct[0], window_title, 256, 256, 64, 64, 0, "
+      "    new_window(&window_struct, window_title, 256, 256, 64, 64, 0, "
       "0);\n"
       "    \n"
-      "    draw_hello(&window_struct[0]);\n"
+      "    draw_hello(&window_struct);\n"
       "    \n"
       "    while (1) {\n"
-      "        event_type = get_next_window_event(&window_struct[0]);\n"
-      "        \n"
-      "        if (event_type == 1) {\n"
-      "            asm(\"    call end_current_task\");\n"
-      "        }\n"
+      //   "        event_type = get_next_window_event(*window_struct);\n"
+      //   "        \n"
+      //   "        if (event_type == 1) {\n"
+      //   "            asm(\"    call end_current_task\");\n"
+      //   "        }\n"
       "        \n"
       "        asm(\"    call yield_task\");\n"
       "    }\n"
       "    \n"
-      "    return 0;\n"
       "}\n";
 
   char *empty_test_program = "int main() {\n"

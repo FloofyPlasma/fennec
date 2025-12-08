@@ -1,0 +1,19 @@
+--- output.fasm	2025-12-07 23:01:42.348002085 -0500
++++ testCode.fasm	2025-12-07 23:00:16.257752712 -0500
+@@ -42,6 +42,7 @@
+ 	pop r2
+ 	pop r1
+ 	pop r0
++    mov r0, window_struct
+ 	call new_window
+ 	mov r0, 0
+ 	push r0
+@@ -113,6 +114,8 @@
+ window_title: data.strz "Hello fox32os!"
+ hello_str: data.strz "Hello from C!"
+ 
++window_struct: data.fill 0, 40
++
+ ; Includes :3
+ 
+ #include "../fox32rom/fox32rom.def"
